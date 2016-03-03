@@ -1,0 +1,281 @@
+/*
+* Copyright (c) 1999 - 2005 NetGroup, Politecnico di Torino (Italy)
+* Copyright (c) 2005 - 2006 CACE Technologies, Davis (California)
+* All rights reserved.
+* Modified by Eric Ball, 2016.
+*
+* Redistribution and use in source and binary forms, with or without
+* modification, are permitted provided that the following conditions
+* are met:
+*
+* 1. Redistributions of source code must retain the above copyright
+* notice, this list of conditions and the following disclaimer.
+* 2. Redistributions in binary form must reproduce the above copyright
+* notice, this list of conditions and the following disclaimer in the
+* documentation and/or other materials provided with the distribution.
+* 3. Neither the name of the Politecnico di Torino, CACE Technologies
+* nor the names of its contributors may be used to endorse or promote
+* products derived from this software without specific prior written
+* permission.
+*
+* THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+* "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+* LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+* A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+* OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+* SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+* LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+* DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+* THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+* (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+* OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*
+*/
+
+#include "stdio.h"
+#include "stdafx.h"
+#include "winsock2.h"   //need winsock for inet_ntoa and ntohs methods
+
+#define HAVE_REMOTE
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
+#include "pcap.h"   //Winpcap :)
+
+#pragma comment(lib , "ws2_32.lib") //For winsock
+#pragma comment(lib , "wpcap.lib") //For winpcap
+
+/* 4 bytes IP address */
+typedef struct ip_address {
+	u_char byte1;
+	u_char byte2;
+	u_char byte3;
+	u_char byte4;
+}ip_address;
+
+/* 6 bytes MAC address */
+typedef struct mac_address {
+	u_char byte1;
+	u_char byte2;
+	u_char byte3;
+	u_char byte4;
+	u_char byte5;
+	u_char byte6;
+}mac_address;
+
+/* ARP header  */
+typedef struct arp_header {
+	u_short htype;			// Hardware type
+	u_short ptype;			// Protocol type
+	u_char hlen;			// Hardware address length
+	u_char plen;			// Protocol address length
+	u_short oper;			// Operation
+	mac_address sha;		// Sender hardware address
+	mac_address tha;		// Target hardware address
+	u_int tpa;				// Target protocol address
+}arp_header;
+
+/* IPv4 header */
+typedef struct ip_header {
+	u_char  ver_ihl;        // Version (4 bits) + Internet header length (4 bits)
+	u_char  tos;            // Type of service 
+	u_short tlen;           // Total length 
+	u_short identification; // Identification
+	u_short flags_fo;       // Flags (3 bits) + Fragment offset (13 bits)
+	u_char  ttl;            // Time to live
+	u_char  proto;          // Protocol
+	u_short crc;            // Header checksum
+	ip_address  saddr;      // Source address
+	ip_address  daddr;      // Destination address
+	u_int   op_pad;         // Option + Padding
+}ip_header;
+
+/* UDP header*/
+typedef struct udp_header {
+	u_short sport;          // Source port
+	u_short dport;          // Destination port
+	u_short len;            // Datagram length
+	u_short crc;            // Checksum
+}udp_header;
+
+/* prototype of the packet handler */
+void packet_handler(u_char *param, const struct pcap_pkthdr *header, const u_char *pkt_data);
+
+
+int main()
+{
+	pcap_if_t *alldevs;
+	pcap_if_t *d;
+	int inum;
+	int i = 0;
+	pcap_t *adhandle;
+	char errbuf[PCAP_ERRBUF_SIZE];
+	u_int netmask;
+	char packet_filter[] = "arp";
+	struct bpf_program fcode;
+
+	/* Retrieve the device list */
+	if (pcap_findalldevs_ex(PCAP_SRC_IF_STRING, NULL, &alldevs, errbuf) == -1)
+	{
+		fprintf(stderr, "Error in pcap_findalldevs: %s\n", errbuf);
+		exit(1);
+	}
+
+	/* Print the list */
+	for (d = alldevs; d; d = d->next)
+	{
+		printf("%d. %s", ++i, d->name);
+		if (d->description)
+			printf(" (%s)\n", d->description);
+		else
+			printf(" (No description available)\n");
+	}
+
+	if (i == 0)
+	{
+		printf("\nNo interfaces found! Make sure WinPcap is installed.\n");
+		return -1;
+	}
+
+	printf("Enter the interface number (1-%d):", i);
+	scanf_s("%d", &inum);
+
+	if (inum < 1 || inum > i)
+	{
+		printf("\nInterface number out of range.\n");
+		/* Free the device list */
+		pcap_freealldevs(alldevs);
+		return -1;
+	}
+
+	/* Jump to the selected adapter */
+	for (d = alldevs, i = 0; i< inum - 1;d = d->next, i++);
+
+	/* Open the adapter */
+	if ((adhandle = pcap_open(d->name,  // name of the device
+		65536,     // portion of the packet to capture. 
+				   // 65536 grants that the whole packet will be captured on all the MACs.
+		PCAP_OPENFLAG_PROMISCUOUS,         // promiscuous mode
+		1000,      // read timeout
+		NULL,      // remote authentication
+		errbuf     // error buffer
+		)) == NULL)
+	{
+		fprintf(stderr, "\nUnable to open the adapter. %s is not supported by WinPcap\n");
+		/* Free the device list */
+		pcap_freealldevs(alldevs);
+		return -1;
+	}
+
+	/* Check the link layer. We support only Ethernet for simplicity. */
+	if (pcap_datalink(adhandle) != DLT_EN10MB)
+	{
+		fprintf(stderr, "\nThis program works only on Ethernet networks.\n");
+		/* Free the device list */
+		pcap_freealldevs(alldevs);
+		return -1;
+	}
+
+	if (d->addresses != NULL)
+		/* Retrieve the mask of the first address of the interface */
+		netmask = ((struct sockaddr_in *)(d->addresses->netmask))->sin_addr.S_un.S_addr;
+	else
+		/* If the interface is without addresses we suppose to be in a C class network */
+		netmask = 0xffffff;
+
+
+	//compile the filter
+	if (pcap_compile(adhandle, &fcode, packet_filter, 1, netmask) <0)
+	{
+		fprintf(stderr, "\nUnable to compile the packet filter. Check the syntax.\n");
+		/* Free the device list */
+		pcap_freealldevs(alldevs);
+		return -1;
+	}
+
+	//set the filter
+	if (pcap_setfilter(adhandle, &fcode)<0)
+	{
+		fprintf(stderr, "\nError setting the filter.\n");
+		/* Free the device list */
+		pcap_freealldevs(alldevs);
+		return -1;
+	}
+
+	printf("\nlistening on %s...\n", d->description);
+
+	/* At this point, we don't need any more the device list. Free it */
+	pcap_freealldevs(alldevs);
+
+	/* start the capture */
+	pcap_loop(adhandle, 0, packet_handler, NULL);
+
+	return 0;
+}
+
+int compare_mac(mac_address target, mac_address test) {
+	if (target.byte1 == test.byte1 &&
+		target.byte2 == test.byte2 &&
+		target.byte3 == test.byte3 &&
+		target.byte4 == test.byte4 &&
+		target.byte5 == test.byte5 &&
+		target.byte6 == test.byte6)
+		return 1;
+	else
+		return 0;
+}
+
+/* Callback function invoked by libpcap for every incoming packet */
+void packet_handler(u_char *param, const struct pcap_pkthdr *header, const u_char *pkt_data)
+{
+	struct tm ltime;
+	char timestr[16];
+	ip_header *ih;
+	arp_header *ah;
+	u_int ip_len;
+	time_t local_tv_sec;
+
+	/*
+	* Unused variable
+	*/
+	(VOID)(param);
+
+	mac_address target_mac;
+	target_mac.byte1 = 0xf0;
+	target_mac.byte2 = 0x27;
+	target_mac.byte3 = 0x2d;
+	target_mac.byte4 = 0x52;
+	target_mac.byte5 = 0x17;
+	target_mac.byte6 = 0xc2;
+
+	/* convert the timestamp to readable format */
+	local_tv_sec = header->ts.tv_sec;
+	localtime_s(&ltime, &local_tv_sec);
+	strftime(timestr, sizeof timestr, "%H:%M:%S", &ltime);
+
+	/* print timestamp and length of the packet */
+	printf("%s.%.6d len:%d ", timestr, header->ts.tv_usec, header->len);
+
+	/* retireve the position of the ip header */
+	ih = (ip_header *)(pkt_data +
+		14); //length of ethernet header
+
+			 /* retireve the position of the udp header */
+	ip_len = (ih->ver_ihl & 0xf) * 4;
+	ah = (arp_header *)((u_char*)ih + ip_len);
+
+	/* convert from network byte order to host byte order */
+	//sport = ntohs(uh->sport);
+	//dport = ntohs(uh->dport);
+
+	/* print ip addresses and udp ports */
+	printf("Source MAC address: %x:%x:%x:%x:%x:%x\n",
+		ah->sha.byte1,
+		ah->sha.byte2,
+		ah->sha.byte3,
+		ah->sha.byte4,
+		ah->sha.byte5,
+		ah->sha.byte6);
+
+	if (compare_mac(target_mac, ah->sha)) {
+		printf("ZOMG! I found a dash button!\n");
+	}
+}
